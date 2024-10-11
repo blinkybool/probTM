@@ -159,20 +159,93 @@ def all_deltas(num_states: int, num_symbols: int) -> Int[Array, "b Q S 3"]:
     
     return deltas
 
-def encode(spec: TuringMachineSpec) -> str:
+def encode(spec: TuringMachineSpec, blank: str) -> str:
     delta = spec.delta
 
     expressions = []
     for read in range(delta.shape[0]):
         for state in range(delta.shape[1]):
             write, next_state, move = delta[read, state]
-            move_letter = ["N", "L", "R"][move]
-            expressions.append("D" + "A" * state + "D" + "C" * read + "D" + "C" * write + move_letter + "D" + "A" * next_state)
-    
-    return ";".join(expressions)
+            
+            # Ignore transitions out of halt state and replace 1 -> n, 0 -> 1
+            if state == 0:
+                state = 1
+            elif state == 1:
+                continue
 
+            if next_state == 0:
+                next_state = 1
+            elif next_state == 1:
+                next_state = delta.shape[1]
+
+            move_letter = ["N", "L", "R"][move]
+            expressions.append("D" + "A" * (state) + "D" + "C" * read + "D" + "C" * write + move_letter + "D" + "A" * (next_state + 1))
+    
+    description = ";".join(expressions)
+
+    return "əə" + blank.join(description) + "$"
+
+def make_UTM():
+    symbols = 'ACD01uvwxyzə_'
+    blank = '_'
+
+    def sequence(reads, state: str, actions, final_state: str):
+        '''
+        Example: sequence('abc', 'q', ('P1', 'R', 'P0', 'L', 'L'), 'p')
+        Behaviour: "In state q if reading 'a', 'b' or 'c', print 1, go right, print 0, then go left twice, and enter state p"
+        '''
+        next_state = f'{state}\'' if len(actions) > 1 else final_state
+
+        for i, action in enumerate(actions):
+            if i == len(actions) - 1:
+                next_state = final_state
+            else:
+                next_state = f'{state}\''
+            if action[0] == 'P':
+                yield from ((s, state, action[1], next_state, 'N') for s in reads)
+            else:
+                assert action in "LR"
+                yield from ((s, state, s, next_state, action) for s in reads)
+            
+            reads = symbols
+
+    def switch(reads, state: str, new_state: str):
+        '''
+        Example: switch('abc', 'q', 'p')
+        Behaviour: "In state q if reading 'a', 'b' or 'c', stay in the same place and enter state p"
+        '''
+        yield from ((s, state, s, new_state, 'N') for s in reads)
+
+    def f(C,B,a):
+        q = f'f({C},{B},{a})'
+        q1 = f'f1({C},{B},{a})'
+        q2 = f'f2({C},{B},{a})'
+        yield ('ə', q, 'ə', q1, 'L')
+        yield from ((s, q, s, q, 'L') for s in symbols if s != 'ə')
+
+        yield (a, q1, a, C, 'N')
+        yield from ((s,q1,s,q1,'R') for s in symbols if s != blank and s != a)
+        yield (blank,q1,blank,q2,'R')
+
+        yield (a, q2, a, C, 'N')
+        yield from ((s,q2,s,q1,'R') for s in symbols if s != blank and s != a)
+        yield (blank,q1,blank,B,'R')
+
+
+    assert False, "Not done yet"
+
+    return make_TM_spec(
+        [
+            *((s, 'b', s, 'f(b1,b1,$)') for s in symbols),
+            *f('b1','b1','$'),
+            *sequence(symbols, 'b1', ('R','R','P:','R','R','PD','R','R','PA'), 'anf'),
+            *((s, 'b', s, 'f(b1,b1,$)') for s in symbols),
+            # *switch(symbols, 'anf', g('anf1', ':')),
+        ]
+    )
 
 def main():
+    # Doubles the contents of the tape (a string of 0s and 1s)
     doubler = make_TM_spec(
        [
            ('0', 'init', 'x', 'init', 'R'),
@@ -209,6 +282,7 @@ def main():
     )
 
     print(format_execution(doubler, *run_TM(doubler, "10010", 200)))
+    # print(encode(doubler, "_"))
 
 
 if __name__ == "__main__":
