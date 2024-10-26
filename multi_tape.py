@@ -46,27 +46,7 @@ def make_TM_spec(
     symbols = list(symbols)
     inputs = set()
 
-    # converted = []
-    # for transition in transitions:
-    #     if len(transition) == 5:
-    #         converted.append(transition)
-    #     elif len(transition) == 4:
-    #         state, reads, action, next_state = transition
-    #         assert all(read in symbols+blank for read in reads)
-    #         if action in {stay, left, right}:
-    #             for read in reads:
-    #                 converted.append((state, read, read, action, next_state))
-    #         else:
-    #             assert len(action) == 2, f"Bad action {action}"
-    #             assert action[0] == 'P', f"Bad action {action}"
-    #             assert action[1] == blank or action[1] in symbols, f"Bad action {action}"
-    #             for read in reads:
-    #                 converted.append((state, read, action[1], stay, next_state))
-    #     else:
-    #         raise ValueError(f"Bad transition {transition}")
-
     tape_alphabet = [blank] + symbols
-
 
     for transition in transitions:
         assert len(transition) == 5, f"Bad transition {transition} (only {len(transition)} entries)"
@@ -118,15 +98,10 @@ def make_TM_spec(
 
 def step(multi_tape: Int[Array, "m t"], multi_heads: Int[Array, "m"], state: int, delta: Int[Array, "Q ... O"]) -> tuple[Int[Array, "m t"], Int[Array, "m"], int]:
     reads = multi_tape[jnp.arange(multi_tape.shape[0]), multi_heads]
-    # jax.debug.print("state={state} reads={reads}", state=state, reads=reads)
     output = delta[state, *reads]
-    # jax.debug.print("output={output}", output=output)
     writes = output[:multi_tape.shape[0]]
-    # jax.debug.print("writes={writes}", writes=writes)
     moves = output[multi_tape.shape[0]:-1]
-    # jax.debug.print("moves={moves}", moves=moves)
     new_state = output[-1]
-    # jax.debug.print("new_state={new_state}", new_state=new_state)
     multi_tape  = jnp.where(state == 1, multi_tape,  multi_tape.at[jnp.arange(multi_tape.shape[0]), multi_heads].set(writes))
     dirs = jnp.where(moves == 0, 0, jnp.where(moves == 1, -1, 1))
     multi_heads = jnp.where(state == 1, multi_heads, multi_heads + dirs)
@@ -275,18 +250,18 @@ def make_pseudo_utm(
 
     inputs = itertools.product(utm_alph, utm_alph, notX, notX)
     for reads in inputs:
+        # Note a and b can be X, but c and d cannot by definition of `inputs`
         (a,b,c,d) = reads
 
         '''
         Update phase
         '''
 
-        # compSymbol (modified from GPS paper)
+        # compSymbol (modified branching choices from GPS paper - i.e. we allow b == X)
         if a == 'X':
-            # If we've reached the end of the description, then the staging
-            # head is not X if we found what we have to do next
-            if b != 'X':
-                transitions.append(('compSymbol', reads, reads, 'LLSS', 'updateSymbol'))
+            # If we've reached the end of the description, now we perform an update
+            # Note that the staging tape may still say XXX
+            transitions.append(('compSymbol', reads, reads, 'LLSS', 'updateSymbol'))
         else:
             # Otherwise we're looking for a transition matching the current working head symbol
             # and state on the state tape (we'll go to compState to check that)
@@ -295,11 +270,12 @@ def make_pseudo_utm(
             elif a == sim_blank and d == utm_blank:
                 transitions.append(('compSymbol', reads, (a,b,c,sim_blank), 'RLSS', 'compState'))
             else:
+                # No match, take the ¬ path so we just walk to the next transition
                 transitions.append(('compSymbol', reads, reads, 'RLSS', '¬compState'))
 
         # Here we do one step of the simulated TM if we have something on the staging tape, or
         # nothing if we don't.
-        if a != 'X':
+        if a != 'X': # Whether we should not have this a != X is a subtle edge case when there are *no* transitions on the description tape
             if b == 'X':
                 # Left path of update phase (do nothing)
                 transitions.append(('updateSymbol', reads, reads, 'SRSS', 'updateState'))
@@ -313,22 +289,25 @@ def make_pseudo_utm(
                     transitions.append(('updateDir', reads, (a,'X',c,d), 'SLS' + b, 'resetDescr'))
 
         # resetDescr
-        if a != 'X': # removed `and b != 'X'`
+        # Note: GPS paper prevents b == X incorrectly.
+        if a != 'X':
             transitions.append(('resetDescr', reads, reads, 'LSSS', 'resetDescr'))
-        else: # removed `a == 'X' and b != 'X'`
+        else:
             transitions.append(('resetDescr', reads, reads, 'RSSS', 'compSymbol'))
 
         '''
         scan phase
         '''
 
+        # Have allowed b == X in these transitions, which differs from GPS paper
+
         # compState
-        if a == c and a != 'X': # removed `and b != 'X'`
+        if a == c and a != 'X':
             transitions.append(('compState', reads, reads, 'RSSS', 'copySymbol'))
         else:
             transitions.append(('compState', reads, reads, 'RSSS', '¬copySymbol'))
 
-        if a != 'X': # removed `and b != 'X'`
+        if a != 'X':
             # Copy ouputs of transition to staging tape
             transitions.append(('copySymbol', reads, (a,a,c,d), 'RRSS', 'copyState'))
             transitions.append(('copyState', reads, (a,a,c,d), 'RRSS', 'copyDir'))
@@ -415,20 +394,20 @@ def main():
         ('write1', '_', '1', 'L', 'skip'),
     ]
 
-    encoded = encode_description(doubler_transitions)
+    encoded = encode_description(simple_transitions)
 
     utm = make_pseudo_utm(
-        sim_states=['init', 'skip', 'find', 'copy', 'write0', 'write1'],
-        sim_symbols=list('01xy'),
+        sim_states=['b', 'c'],
+        sim_symbols=list('01'),
         sim_blank='_',
     )
 
     multi_tapes, multi_heads, states = run_TM(
         spec=utm,
-        multi_input=(encoded, ['X','X','X'], ['init'], list('_01001')),
-        multi_tape_shape=((4,128)),
-        head_zeros=jnp.array([1, 1, 0, 1]),
-        max_steps=245 * 100,
+        multi_input=(encoded, ['X','X','X'], ['b'], []),
+        multi_tape_shape=((4,16)),
+        head_zeros=jnp.array([1, 1, 0, 0]),
+        max_steps=25 * 4,
     )
 
     # Run the TM interactively
