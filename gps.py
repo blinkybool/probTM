@@ -8,8 +8,10 @@
     contrasting the (q,s,s',d,q') order that is used in other files (which
     reads more naturally imo). There is also no halt_state.
 
+    Skip to direct_sim_step for the meat of the file.
+
     # Internal Representation
-    Symbols, states, directions are integers
+    Symbols, states, directions are integers (indices into distribution arrays)
 
     0 is the blank symbol
     0 is the initial state
@@ -19,56 +21,56 @@
 '''
 
 from dataclasses import dataclass
-from jaxtyping import Array, Int, Float, Bool, PRNGKeyArray
+from jaxtyping import Array, Int, Float
 import jax
 import jax.numpy as jnp
-from typing import List, Tuple
+from typing import List, Tuple, Sequence
 import numpy as np
 import readchar
 import shutil
+import strux
 import functools
 import einops
 
-@dataclass
+@strux.struct(static_fieldnames=("tape_alphabet", "states", "moves"))
 class SmoothTuringMachine:
-    tape_alphabet: List[str]
-    states: List[str]
-    moves: List[str]
+    tape_alphabet: Tuple[str]
+    states: Tuple[str]
+    moves: Tuple[str]
     delta_write: Float[Array, "Σ Q Σ"]
     delta_state: Float[Array, "Σ Q Q"]
     delta_move: Float[Array, "Σ Q 3"]
 
     def theta_from_input_pairs(
         self,
-        pairs: List[Tuple[str,str]]
-    ) -> Float[Array, "T 2"]:
+        pairs: Sequence[Tuple[str,str]]
+    ) -> Float[Array, "D 2"]:
         '''
         Convert (symbol,state) pairs (as strings) to an array of indices that
         can be used to index into arrays of shape (Σ,Q).
         '''
-        assert len(set(pairs)) == len(pairs), "pairs must be unique"
+        assert len(set(pairs)) == len(list(pairs)), "pairs must be unique"
         return jnp.array([(self.tape_alphabet.index(s), self.states.index(q)) for (s, q) in pairs])
     
     def descriptions_from_theta(
         self,
-        theta: Int[Array, "T 2"] | None,
-    ) -> Tuple[Int[Array, "T Σ"], Int[Array, "T Q"], Int[Array, "T 3"]]:
+        theta: Int[Array, "D 2"],
+    ) -> Tuple[Float[Array, "D Σ"], Float[Array, "D Q"], Float[Array, "D 3"]]:
         '''
         Generate the TM "description" for use in direct-simulation.
-        Converts the delta arrays from (Σ,Q)-indexing to (T,)-indexing via theta
+        Converts the delta arrays from (Σ,Q)-indexing to (D,)-indexing via theta
         '''
-        if theta is None:
-            return self.delta_write.ravel(), self.delta_state.ravel(), self.delta_move.ravel()
         descr_write = self.delta_write[theta[:,0], theta[:,1]]
         descr_state = self.delta_state[theta[:,0], theta[:,1]]
-        descr_move  = self.delta_move[theta[:,0],  theta[:,1]]
+        descr_move = self.delta_move[theta[:,0], theta[:,1]]
         return descr_write, descr_state, descr_move
     
     def prepare_initial_config(
         self,
         input_symbols: List[str],
         tape_radius: int,
-    ) -> Tuple[Int[Array, "t Σ"], Int[Array, "Q"], Int]:
+    ) -> Tuple[Float[Array, "T Σ"], Float[Array, "Q"], Int]:
+        assert tape_radius - 1 >= len(input_symbols)
         
         Σ = len(self.tape_alphabet)
         Q = len(self.states)
@@ -90,18 +92,16 @@ class SmoothTuringMachine:
         
         return start_tape, start_state, head_zero
     
-    @functools.partial(jax.jit, static_argnames=['input_symbols', 'tape_radius', 'num_steps', 'theta'])
+    @functools.partial(jax.jit, static_argnames=("head_zero", "num_steps"))
     def run(
         self,
-        input_symbols: List[str],
-        tape_radius: int,
+        initial_tape: Float[Array, "T Σ"],
+        initial_state: Float[Array, "Q"],
+        head_zero: int,
         num_steps: int,
-        theta: Int[Array, "T 2"] | None = None,
-    ) -> tuple[Int[Array, "t Σ"], Int[Array, "Q"], Int]:
-        assert tape_radius - 1 >= len(input)
-
+        theta: Int[Array, "D 2"],
+    ) -> tuple[Float[Array, "T Σ"], Float[Array, "Q"]]:
         descr_write, descr_state, descr_move = self.descriptions_from_theta(theta)
-        start_tape, start_state, head_zero = self.prepare_initial_config(input_symbols, tape_radius)
 
         def iter_func(_, config):
             return direct_sim_step(
@@ -117,23 +117,22 @@ class SmoothTuringMachine:
             lower=0,
             upper=num_steps,
             body=iter_func,
-            init_val=(start_tape, start_state)
+            init_val=(initial_tape, initial_state)
         )
 
         return final_tape, final_state, head_zero
 
-    # @functools.partial(jax.jit, static_argnames=['input_symbols', 'tape_radius', 'num_steps'])
+    @functools.partial(jax.jit, static_argnames=("head_zero", "num_steps"))
     def run_history(
         self,
-        input_symbols: List[str],
-        tape_radius: int,
+        initial_tape: Float[Array, "T Σ"],
+        initial_state: Float[Array, "Q"],
+        head_zero: int,
         num_steps: int,
-        theta: Int[Array, "T 2"] | None = None,
-    ) -> tuple[Int[Array, "h t Σ"], Int[Array, "h Q"], Int]:
-        assert tape_radius - 1 >= len(input_symbols)
+        theta: Int[Array, "D 2"],
+    ) -> tuple[Float[Array, "H T Σ"], Float[Array, "H Q"], Int]:
 
         descr_write, descr_state, descr_move = self.descriptions_from_theta(theta)
-        start_tape, start_state, head_zero = self.prepare_initial_config(input_symbols, tape_radius)
 
         def scan_func(config, _):
             stepped = direct_sim_step(
@@ -144,11 +143,12 @@ class SmoothTuringMachine:
                 descr_move=descr_move,
                 theta=theta,
             )
+            # stepped is the new carry, current carry is the output
             return (stepped, config)
 
         _, (tape_history, state_history) = jax.lax.scan(
             f=scan_func,
-            init=(start_tape, start_state),
+            init=(initial_tape, initial_state),
             length=num_steps+1,
         )
         return tape_history, state_history, head_zero
@@ -200,18 +200,34 @@ class SmoothTuringMachine:
 
 
 def direct_sim_step(
-        tape: Int[Array, "t Σ"],
-        state: Int[Array, "Q"],
+        tape: Float[Array, "T Σ"],
+        state: Float[Array, "Q"],
         head_zero: int,
-        descr_write: Int[Array, "T Σ"],
-        descr_state: Int[Array, "T Q"],
-        descr_move:  Int[Array, "T 3"],
-        theta: Int[Array, "T 2"] | None = None,
-    ) -> Tuple[Int[Array, "t Σ"], Int[Array, "Q"]]:
+        descr_write: Float[Array, "D Σ"],
+        descr_state: Float[Array, "D Q"],
+        descr_move:  Float[Array, "D 3"],
+        theta: Int[Array, "D 2"],
+    ) -> Tuple[Float[Array, "T Σ"], Float[Array, "Q"]]:
     '''
-    Direct simulation of the working tape and state of a TM running on a probabilistic UTM
+    Direct simulation of the working tape and state of a TM running on a probabilistic UTM.
+
+    Axis Dimenions:
+    T is the width of the tape (=2*tape_radius + 1)
+    Σ is the size of the tape alphabet
+    Q is the number of states
+    3 is the number of moves (left, stay, right)
+    D is the number of tuples of the description tape indexed by theta
+
+    Args:
+    tape: the working tape of the simulated TM (relative indexing + squares are distributions over alphabet)
+    head_zero: tape[head_zero] is treated as the 0th head-relative tape square (usually =tape_radius)
+    descr_write, descr_state, descr_move:
+        A version of the smooth-tm's delta function that has been already re-indexed by theta,
+        so that descr_write[i] = delta_write[s,q] where theta[i] = [s,q]
+    theta: effectively a map [0..D-1] -> Σ x Q, that enumerates transitions on the description tape
+        by their inputs (s,q) ∈ Σ x Q.
     '''
-    T = theta.shape[0]
+    D = theta.shape[0]
     Σ = tape.shape[1]
     Q = state.shape[0]
 
@@ -220,18 +236,15 @@ def direct_sim_step(
     assert head_and_state.shape == (Σ, Q)
 
     # λ[i] is the probability that the ith tuple matches the current head and state
-    # λ.shape == (T,)
-    if theta is None:
-        λ = head_and_state.ravel()
-    else:
-        λ = head_and_state[theta[:,0], theta[:,1]]
+    λ = head_and_state[theta[:,0], theta[:,1]]
+    assert λ.shape == (D,)
 
     # μ[i] is the probability that the ith tuple will be written on the staging tape
     # after the scan phase. In other words, it is the probability that the ith tuple
     # is the *last* matching tuple, calculated as λ[i] × Π_{j>i} (1-λ[j])
     # μX is the probability that no tuple is written on the staging tape (so it's stays XXX)
     μX, μ = jax.lax.scan(lambda c, x: ((1-x) * c, x * c), 1, λ, reverse=True)
-    assert μ.shape == (T,)
+    assert μ.shape == (D,)
     assert μX.shape == ()
 
     # These distributions describe what will be on the staging tape after the scan phase
@@ -242,8 +255,9 @@ def direct_sim_step(
     assert stage_state.shape == (Q,)
     assert stage_move.shape == (3,)
 
+    # Augment the probabilities by the default behaviour (do nothing) with probability μX
     move = stage_move + jnp.array([μX, 0, 0])
-    write = μX * tape[head_zero] + stage_write # write[σ] is Aσ
+    write = μX * tape[head_zero] + stage_write # write[σ] is Aσ from GPS
     new_state = μX * state + stage_state
     assert move.shape == (3,)
     assert write.shape == (Σ,)
@@ -256,9 +270,9 @@ def direct_sim_step(
 
     new_tape = (
         stay * new_tape
-        # shift tape left and insert blank at end
-        + left * jnp.roll(new_tape, 1, axis=0).at[0].set(blank)
         # shift tape right and insert blank at start
+        + left * jnp.roll(new_tape, 1, axis=0).at[0].set(blank)
+        # shift tape left and insert blank at end
         + right * jnp.roll(new_tape, -1, axis=0).at[-1].set(blank)
     )
     assert new_tape.shape == tape.shape
@@ -320,9 +334,9 @@ class TuringMachine:
                     delta_move[i,j,0] = 1.0
 
         return SmoothTuringMachine(
-            tape_alphabet=self.tape_alphabet,
-            states=self.states,
-            moves=self.moves,
+            tape_alphabet=tuple(self.tape_alphabet),
+            states=tuple(self.states),
+            moves=tuple(self.moves),
             delta_write=jnp.array(delta_write),
             delta_state=jnp.array(delta_state),
             delta_move=jnp.array(delta_move),
@@ -334,12 +348,15 @@ class TuringMachine:
 
 def interactive_TM(
         smooth_tm: SmoothTuringMachine,
-        tape_history: Float[Array, "h t Σ"],
-        state_history: Float[Array, "h Q"],
+        tape_history: Float[Array, "H T Σ"],
+        state_history: Float[Array, "H Q"],
         head_zero: int,
     ):
 
-    def bg_greyscale(val: int) -> str:
+    H, tape_size, Σ = tape_history.shape
+    Q = state_history.shape[1]
+
+    def bg_fg_greyscale(val: int) -> str:
         '''
         Return a highlight symbol with ANSI codes
         0 <= val <= 255
@@ -348,20 +365,16 @@ def interactive_TM(
         fg = f'\033[38;2;{0};{0};{0}m'
         return bg+fg
 
-    h, tape_size, Σ = tape_history.shape
-    Q = state_history.shape[1]
+    greyscale_codes = np.char.array([bg_fg_greyscale(i) for i in range(256)])
 
-    greyscale_codes = np.char.array([bg_greyscale(i) for i in range(256)])
-
-    # tapes_by_symbol = einops.rearrange(tape_history, "h t Σ -> h Σ t")
     tapes_greyscale = greyscale_codes[jnp.astype(255 * tape_history, jnp.uint8)]
     states_greyscale = greyscale_codes[jnp.astype(255 * state_history, jnp.uint8)]
 
     tapes_highlighted = tapes_greyscale + np.char.array(smooth_tm.tape_alphabet)
     states_highlighted = states_greyscale + np.char.array(smooth_tm.states)
 
-    assert tapes_highlighted.shape == (h, tape_size, Σ)
-    assert states_highlighted.shape == (h, Q)
+    assert tapes_highlighted.shape == (H, tape_size, Σ)
+    assert states_highlighted.shape == (H, Q)
 
     RESET_FG = '\033[39m'
     RESET_BG = '\033[49m'
@@ -371,7 +384,7 @@ def interactive_TM(
         [
             ''.join(symbol_tape) + RESET_FG + RESET_BG for symbol_tape in tapes_by_symbol
         ]
-        for tapes_by_symbol in einops.rearrange(tapes_highlighted, "h t Σ -> h Σ t")
+        for tapes_by_symbol in einops.rearrange(tapes_highlighted, "H T Σ -> H Σ T")
     ]
     states_rendered = [
         ''.join(state) + RESET_FG + RESET_BG for state in states_highlighted
@@ -387,7 +400,7 @@ def interactive_TM(
         tape_by_symbol = tapes_rendered[step]
 
         lines = [
-            f'Step: {step}/{h-1} | Press Q to quit | ↓/↑ to step forward/back',
+            f'Step: {step}/{H-1} | Press Q to quit | ↓/↑ to step forward/back',
             'State: ' + state,
             'Tape (head=▾):',
             ' ' * head_zero + '▾',
@@ -410,7 +423,7 @@ def interactive_TM(
             if step > 0:
                 step -= 1
         elif key == readchar.key.DOWN:
-            if step < h-1:
+            if step < H-1:
                 step += 1
         
         cols, _ = shutil.get_terminal_size()
@@ -447,6 +460,7 @@ def main():
     )
 
     input_symbols = list('BBBBBBBBBBBBBBBBABA')
+    tape_radius = len(input_symbols) + 3
 
     smooth_tm = detectA.relax()
     smooth_tm = smooth_tm.nudge_move(
@@ -457,10 +471,16 @@ def main():
     )
     theta = smooth_tm.theta_from_input_pairs(detectA.transition_input_pairs())
 
-    tape_history, state_history, head_zero = smooth_tm.run_history(
+    initial_tape, initial_state, head_zero = smooth_tm.prepare_initial_config(
         input_symbols=input_symbols,
-        tape_radius=len(input_symbols) + 3,
-        num_steps=42,
+        tape_radius=tape_radius,
+    )
+
+    tape_history, state_history, head_zero = smooth_tm.run_history(
+        initial_tape=initial_tape,
+        initial_state=initial_state,
+        head_zero=head_zero,
+        num_steps=100,
         theta=theta,
     )
 
