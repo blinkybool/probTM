@@ -31,6 +31,7 @@ import shutil
 import strux
 import functools
 import einops
+import json
 
 @strux.struct(static_fieldnames=("tape_alphabet", "states", "moves"))
 class SmoothTuringMachine:
@@ -51,7 +52,7 @@ class SmoothTuringMachine:
         '''
         assert len(set(pairs)) == len(list(pairs)), "pairs must be unique"
         return jnp.array([(self.tape_alphabet.index(s), self.states.index(q)) for (s, q) in pairs])
-    
+
     def descriptions_from_theta(
         self,
         theta: Int[Array, "D 2"],
@@ -64,14 +65,14 @@ class SmoothTuringMachine:
         descr_state = self.delta_state[theta[:,0], theta[:,1]]
         descr_move = self.delta_move[theta[:,0], theta[:,1]]
         return descr_write, descr_state, descr_move
-    
+
     def prepare_initial_config(
         self,
         input_symbols: List[str],
         tape_radius: int,
     ) -> Tuple[Float[Array, "T Σ"], Float[Array, "Q"], Int]:
         assert tape_radius - 1 >= len(input_symbols)
-        
+
         Σ = len(self.tape_alphabet)
         Q = len(self.states)
 
@@ -89,9 +90,9 @@ class SmoothTuringMachine:
 
         # Begin with certainty of the initital state
         start_state = jax.nn.one_hot(0, Q)
-        
+
         return start_tape, start_state, head_zero
-    
+
     @functools.partial(jax.jit, static_argnames=("head_zero", "num_steps"))
     def run(
         self,
@@ -112,7 +113,7 @@ class SmoothTuringMachine:
                 descr_move=descr_move,
                 theta=theta,
             )
-        
+
         final_tape, final_state = jax.lax.fori_loop(
             lower=0,
             upper=num_steps,
@@ -152,7 +153,7 @@ class SmoothTuringMachine:
             length=num_steps+1,
         )
         return tape_history, state_history, head_zero
-    
+
     def nudge_write(
         self,
         symbol: str,
@@ -198,7 +199,6 @@ class SmoothTuringMachine:
         )
         return self.replace(delta_move=new_delta_move)
 
-
 def direct_sim_step(
         tape: Float[Array, "T Σ"],
         state: Float[Array, "Q"],
@@ -211,7 +211,7 @@ def direct_sim_step(
     '''
     Direct simulation of the working tape and state of a TM running on a probabilistic UTM.
 
-    Axis Dimenions:
+    Axis Dimensions:
     T is the width of the tape (=2*tape_radius + 1)
     Σ is the size of the tape alphabet
     Q is the number of states
@@ -256,12 +256,12 @@ def direct_sim_step(
     assert stage_move.shape == (3,)
 
     # Augment the probabilities by the default behaviour (do nothing) with probability μX
-    move = stage_move + jnp.array([μX, 0, 0])
     write = μX * tape[head_zero] + stage_write # write[σ] is Aσ from GPS
     new_state = μX * state + stage_state
-    assert move.shape == (3,)
+    move = stage_move + jnp.array([μX, 0, 0])
     assert write.shape == (Σ,)
     assert new_state.shape == (Q,)
+    assert move.shape == (3,)
 
     new_tape = tape.at[head_zero].set(write)
 
@@ -296,7 +296,7 @@ class TuringMachine:
     def relax(self) -> SmoothTuringMachine:
         stay, left, right = self.moves
         inputs = set()
-        
+
         Σ = len(self.tape_alphabet)
         Q = len(self.states)
 
@@ -321,7 +321,7 @@ class TuringMachine:
             delta_write[r,q,w] = 1.0
             delta_state[r,q,p] = 1.0
             delta_move[r,q,m] = 1.0
-        
+
          # Set all unspecified transitions to just self-loop
         for i, s in enumerate(self.tape_alphabet):
             for j, q in enumerate(self.states):
@@ -425,7 +425,7 @@ def interactive_TM(
         elif key == readchar.key.DOWN:
             if step < H-1:
                 step += 1
-        
+
         cols, _ = shutil.get_terminal_size()
         line_count = 0
         for n in widths:
@@ -480,11 +480,20 @@ def main():
         initial_tape=initial_tape,
         initial_state=initial_state,
         head_zero=head_zero,
-        num_steps=100,
+        num_steps=42,
         theta=theta,
     )
 
-    interactive_TM(smooth_tm, tape_history, state_history, head_zero)
+    # Export tape history data
+    tape_history_data = np.array(tape_history).tolist()
+    with open('vis/tape_history.json', 'w') as f:
+        json.dump({
+            'tape_history': tape_history_data,
+            'tape_alphabet': list(smooth_tm.tape_alphabet),
+            'head_zero': int(head_zero)
+        }, f)
+
+    # interactive_TM(smooth_tm, tape_history, state_history, head_zero)
 
 if __name__ == "__main__":
     main()
