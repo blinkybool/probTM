@@ -484,16 +484,7 @@ def main():
         theta=theta,
     )
 
-    # Export tape history data
-    tape_history_data = np.array(tape_history).tolist()
-    with open('vis/tape_history.json', 'w') as f:
-        json.dump({
-            'tape_history': tape_history_data,
-            'tape_alphabet': list(smooth_tm.tape_alphabet),
-            'head_zero': int(head_zero)
-        }, f)
-
-    # interactive_TM(smooth_tm, tape_history, state_history, head_zero)
+    interactive_TM(smooth_tm, tape_history, state_history, head_zero)
 
 if __name__ == "__main__":
     main()
